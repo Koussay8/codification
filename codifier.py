@@ -4,6 +4,7 @@ import csv
 import json
 import re
 import sys
+import time
 import unicodedata
 from copy import copy
 from datetime import datetime
@@ -22,6 +23,8 @@ DOSSIER_INPUT = BASE / "input"
 DOSSIER_OUTPUT = BASE / "output"
 JAUNE = "FFFFFF00"
 LONGUEUR_MAX = 30
+NUM_CTX = 4096          # contexte réduit = moins de RAM / CPU
+MAX_EXEMPLES = 12       # exemples envoyés à l'étape 2 (strict nécessaire)
 # Colonnes (numéros) : A=N°, B=NIMRODA, C=fournisseur, D=réf, I/J/L/O=formules
 COL_K, COL_M, COL_N, COL_P, COL_Q = 11, 13, 14, 16, 17
 COLS_FORMULES = (9, 10, 12, 15)
@@ -72,17 +75,23 @@ def verifier_ollama():
         sys.exit(f"ERREUR : modele absent. Tape dans un terminal :  ollama pull {MODELE}")
 
 
-def appeler_ia(consigne):
-    """Un appel Ollama (JSON imposé). Renvoie un dict ({} si JSON illisible, exception si réseau)."""
-    r = requests.post(f"{URL_OLLAMA}/api/chat", timeout=300, json={
-        "model": MODELE, "stream": False, "format": "json",
-        "options": {"temperature": 0, "num_ctx": 8192},
-        "messages": [{"role": "user", "content": consigne}]})
+def appeler_ia(fixe, variable, titre):
+    """Un appel Ollama indépendant (aucun historique). La partie fixe est placée en premier
+    pour que Ollama réutilise son cache. Affiche entrée / sortie en temps réel."""
+    print(f"     [{titre}] ENVOI ({len(fixe) + len(variable)} car.) :", flush=True)
+    print("       " + variable.replace("\n", "\n       "), flush=True)
+    debut = time.time()
+    r = requests.post(f"{URL_OLLAMA}/api/chat", timeout=600, json={
+        "model": MODELE, "stream": False, "format": "json", "keep_alive": "30m",
+        "options": {"temperature": 0, "num_ctx": NUM_CTX},
+        "messages": [{"role": "user", "content": fixe + "\n\n" + variable}]})
     r.raise_for_status()
+    brut = r.json()["message"]["content"]
+    print(f"     [{titre}] REPONSE en {time.time() - debut:.1f}s : {brut.strip()}", flush=True)
     try:
-        rep = json.loads(r.json()["message"]["content"])
+        rep = json.loads(brut)
         return rep if isinstance(rep, dict) else {}
-    except (ValueError, KeyError):
+    except ValueError:
         return {}
 
 
@@ -116,19 +125,20 @@ def fournisseur_utile(i):
 # ----------------------------- Les 2 étapes IA ----------------------------
 def choisir_sous_famille(i, fam, sub, modeles):
     """Étape 1 : renvoie (clé, None) ou (None, famille_probable)."""
-    liste = "\n".join(f"{n}. {k} : {lib}" for n, (k, lib) in enumerate(sub.items(), 1))
+    print("  Etape 1/2 : choix de la sous-famille", flush=True)
+    liste = "\n".join(f"{k} : {lib}" for k, lib in sub.items())
     ex = []
-    for k in sub:
-        for m in [m for m in modeles if f"{m['K']}-{m['M']}" == k][:2]:
-            ex.append(f"{m['nim']} | {fournisseur_utile(m)} -> {k}")
-    base = (f"Choisis la sous-famille de cet article.\nDesignation NIMRODA : {i['nim']}\n"
-            f"Designation fournisseur : {fournisseur_utile(i) or 'inconnue'}\nRef fournisseur : {i['ref']}\n\n"
-            f"Sous-familles possibles :\n{liste}\n\nExemples deja valides :\n" + "\n".join(ex) +
-            '\n\nReponds en JSON : {"cle": "ABR-RL"} ou {"cle": "AUCUNE"} si rien ne convient.')
+    for k in sub:  # 1 seul exemple par sous-famille
+        for m in [m for m in modeles if f"{m['K']}-{m['M']}" == k][:1]:
+            ex.append(f"{m['nim']} -> {k}")
+    fixe = ("Choisis la cle de sous-famille de l'article. Reponds en JSON : {\"cle\": \"ABR-RL\"} "
+            "ou {\"cle\": \"AUCUNE\"} si rien ne convient.\n\nCles possibles :\n" + liste +
+            "\n\nExemples :\n" + "\n".join(ex))
+    var = f"Article : {i['nim']}" + (f" | fournisseur : {fournisseur_utile(i)}" if fournisseur_utile(i) else "")
     rep = ""
     for essai in range(3):
-        consigne = base if essai == 0 else base + "\n\nreponds uniquement par une cle de la liste."
-        rep = txt(appeler_ia(consigne).get("cle")).upper()
+        suite = "" if essai == 0 else "\nreponds uniquement par une cle de la liste."
+        rep = txt(appeler_ia(fixe, var + suite, f"etape 1, essai {essai + 1}").get("cle")).upper()
         if rep in sub:
             return rep, None
     pref = rep.split("-")[0]
@@ -137,19 +147,19 @@ def choisir_sous_famille(i, fam, sub, modeles):
 
 def construire_detail(i, cle, modeles, utilises):
     """Étape 2 : renvoie (détail, problème) ; problème = None si tout est validé."""
+    print(f"  Etape 2/2 : construction du detail ({cle})", flush=True)
     pareils = [m for m in modeles if f"{m['K']}-{m['M']}" == cle] \
         or [m for m in modeles if m["K"] == cle.split("-")[0]]
-    exemples = "\n".join(f"{m['nim']} | {fournisseur_utile(m)} -> {m['N']}" for m in pareils[-40:])
-    deja = ", ".join(sorted(c.split("-", 2)[2] for c in utilises if c.startswith(cle + "-")))
-    base = (f"{REGLES}\n\nArticle a codifier :\nDesignation NIMRODA : {i['nim']}\n"
-            f"Designation fournisseur : {fournisseur_utile(i) or 'inconnue'}\nSous-famille choisie : {cle}\n\n"
-            f"Exemples valides (NIMRODA | fournisseur -> DETAIL) :\n{exemples}\n\n"
-            f"Details deja utilises dans cette sous-famille : {deja or 'aucun'}\n\n"
+    exemples = "\n".join(f"{m['nim']} | {fournisseur_utile(m)} -> {m['N']}" for m in pareils[-MAX_EXEMPLES:])
+    deja = ", ".join(sorted(c.split("-", 2)[2] for c in utilises if c.startswith(cle + "-"))[-30:])
+    fixe = (f"{REGLES}\n\nSous-famille : {cle}\nExemples valides (NIMRODA | fournisseur -> DETAIL) :\n{exemples}\n"
+            f"Details deja utilises : {deja or 'aucun'}\n\n"
             'Reponds en JSON : {"detail": "D30.15-G60"} (uniquement le DETAIL).')
+    var = f"Article : {i['nim']} | fournisseur : {fournisseur_utile(i) or 'inconnue'}"
     detail, probleme = "", "detail vide"
     for essai in range(2):
-        consigne = base if essai == 0 else base + f"\n\nATTENTION : {probleme} pour '{detail}'. Propose un autre detail."
-        detail = nettoyer(appeler_ia(consigne).get("detail", ""))
+        suite = "" if essai == 0 else f"\nATTENTION : {probleme} pour '{detail}'. Propose un autre detail."
+        detail = nettoyer(appeler_ia(fixe, var + suite, f"etape 2, essai {essai + 1}").get("detail", ""))
         if detail.startswith(cle + "-"):
             detail = detail[len(cle) + 1:]
         if not detail:
@@ -194,6 +204,7 @@ def traiter_fichier(chemin, horodatage, rapport):
 
     for i in a_traiter:
         r, ancien = i["ligne"], code_de(i) or "aucun"
+        print(f"\n>>> Ligne {r}/{ws.max_row} : {i['nim']}", flush=True)
         K = M = N = None
         try:
             cle, fam_probable = choisir_sous_famille(i, fam, sub, modeles)
