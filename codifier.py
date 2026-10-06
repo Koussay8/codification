@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Codification automatique d'articles consommables (Excel).
-Principe : la recherche par mots (sur le Referentiel + lignes validees) decide seule quand c'est
-evident ; l'IA locale (Ollama) n'intervient qu'en dernier recours, avec un contexte minimal."""
+"""Codification automatique d'articles consommables (Excel), 100 % locale (Ollama).
+Sous-famille : un modele d'embeddings compare le SENS de l'article aux libelles du Referentiel et aux lignes deja
+validees ; si c'est net on decide, sinon le LLM tranche entre quelques candidates. Detail : regles lues dans l'Excel."""
 import csv
+import hashlib
 import json
 import math
 import os
@@ -22,16 +23,17 @@ from openpyxl.formula.translate import Translator
 from openpyxl.styles import PatternFill
 
 # ----------------------------- Constantes ---------------------------------
-MODELE = "qwen2.5:3b"   # plus rapide mais moins precis : "qwen2.5:1.5b"
+MODELE = "qwen3:4b"                 # LLM (repli plus leger : "qwen2.5:3b")
+MODELE_EMB = "qwen3-embedding:0.6b"  # embeddings (comprend le francais)
 URL_OLLAMA = "http://localhost:11434"
 BASE = Path(__file__).resolve().parent
 DOSSIER_INPUT, DOSSIER_OUTPUT = BASE / "input", BASE / "output"
 JAUNE = "FFFF00"        # marque "a traiter" posee par l'utilisateur sur la colonne A
 LONGUEUR_MAX = 30
-NUM_CTX, NUM_PREDICT = 2048, 40               # contexte minimal = RAM / CPU legers
+NUM_CTX, NUM_PREDICT = 2048, 24               # contexte minimal = RAM / CPU legers
 NUM_THREAD = max(2, (os.cpu_count() or 4) // 2)  # coeurs physiques (hyper-threading inutile)
-SEUIL_DIRECT, RATIO_DIRECT = 6.0, 1.6           # choix sans IA si score >= seuil et >= ratio x 2e
-NB_CANDIDATES = 6
+ECART_DIRECT, ACCORD_DIRECT = 0.08, 3           # decision sans LLM : ecart de similarite, ou accord des voisins
+K_VOISINS, NB_CANDIDATES = 6, 6
 LIGNES_REFERENTIEL = 500  # les plages VLOOKUP vers le Referentiel sont elargies jusque-la
 # role -> (regex cherchee dans l'en-tete de la ligne 1, colonne par defaut)
 ROLES = {"K": ("code famille", 11), "M": ("code sous", 13), "N": ("^detail", 14),
@@ -52,11 +54,6 @@ def norm(t):
     """Minuscules sans accents."""
     s = unicodedata.normalize("NFKD", txt(t).lower())
     return "".join(c for c in s if not unicodedata.combining(c))
-
-
-def mots(t):
-    """Mots (lettres, >= 3) au singulier approximatif."""
-    return {w[:-1] if len(w) > 4 and w[-1] in "sx" else w for w in re.findall(r"[a-z]{3,}", norm(t))}
 
 
 def nettoyer(detail):
@@ -84,37 +81,52 @@ def pastille(rgb):
 
 
 def verifier_ollama():
-    """Arrete le programme si Ollama / le modele sont absents, puis charge le modele en memoire."""
+    """Arrete le programme si Ollama ou un modele est absent, puis charge le LLM en memoire."""
     try:
         noms = [m["name"] for m in requests.get(f"{URL_OLLAMA}/api/tags", timeout=5).json()["models"]]
     except Exception:
         sys.exit("ERREUR : Ollama ne repond pas. Lance Ollama puis relance ce programme.")
-    if not any(n == MODELE or n.startswith(MODELE + ":") for n in noms):
-        sys.exit(f"ERREUR : modele absent. Tape dans un terminal :  ollama pull {MODELE}")
+    for m in (MODELE, MODELE_EMB):
+        if not any(n == m or n.startswith(m + ":") for n in noms):
+            sys.exit(f"ERREUR : modele absent. Tape dans un terminal :  ollama pull {m}")
     print("Chargement du modele en memoire...", flush=True)
-    requests.post(f"{URL_OLLAMA}/api/chat", timeout=600, json={
-        "model": MODELE, "stream": False, "keep_alive": "30m", "options": {"num_predict": 1, "num_ctx": NUM_CTX},
-        "messages": [{"role": "user", "content": "ok"}]})
+    appeler_ia("ok", "ok", "chargement", ["ok"])
 
 
-def appeler_ia(fixe, variable, titre, choix=None):
-    """Appel Ollama independant (aucun historique). Partie fixe d'abord : le cache Ollama la reutilise.
-    Si `choix` est donne, la reponse est contrainte a {"cle": <une valeur de choix>}."""
+def appeler_ia(fixe, variable, titre, choix):
+    """Appel LLM independant (aucun historique). La reponse est contrainte a {"cle": <une valeur de choix>}."""
     print(f"     {GRIS}[{titre}] ENVOI ({len(fixe) + len(variable)} car.){FIN} " + variable.replace("\n", " / "), flush=True)
     debut = time.time()
-    forme = {"type": "object", "properties": {"cle": {"type": "string", "enum": choix}}, "required": ["cle"]} if choix else "json"
     r = requests.post(f"{URL_OLLAMA}/api/chat", timeout=600, json={
-        "model": MODELE, "stream": False, "format": forme, "keep_alive": "30m",
+        "model": MODELE, "stream": False, "think": False, "keep_alive": "30m",
+        "format": {"type": "object", "properties": {"cle": {"type": "string", "enum": choix}}, "required": ["cle"]},
         "options": {"temperature": 0, "num_ctx": NUM_CTX, "num_predict": NUM_PREDICT, "num_thread": NUM_THREAD},
         "messages": [{"role": "user", "content": fixe + "\n\n" + variable}]})
     r.raise_for_status()
     brut = r.json()["message"]["content"]
     print(f"     {GRIS}[{titre}] REPONSE en {time.time() - debut:.1f}s :{FIN} {brut.strip()}", flush=True)
     try:
-        rep = json.loads(brut)
-        return rep if isinstance(rep, dict) else {}
+        return json.loads(brut)
     except ValueError:
         return {}
+
+
+def embeddings(textes, cache):
+    """Vecteurs de sens (modele d'embeddings) ; ce qui est deja dans le cache n'est pas recalcule."""
+    cle = lambda t: hashlib.md5((MODELE_EMB + t).encode()).hexdigest()
+    manque = [t for t in dict.fromkeys(textes) if cle(t) not in cache]
+    for k in range(0, len(manque), 32):
+        print(f"  Embeddings : {min(k + 32, len(manque))}/{len(manque)} textes", flush=True)
+        r = requests.post(f"{URL_OLLAMA}/api/embed", timeout=600,
+                          json={"model": MODELE_EMB, "input": manque[k:k + 32], "keep_alive": "30m"})
+        r.raise_for_status()
+        for t, v in zip(manque[k:k + 32], r.json()["embeddings"]):
+            cache[cle(t)] = [round(x, 5) for x in v]
+    return [cache[cle(t)] for t in textes]
+
+
+def cos(a, b):
+    return sum(x * y for x, y in zip(a, b)) / (math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b)))
 
 
 # ----------------------------- Lecture du fichier -------------------------
@@ -169,62 +181,31 @@ def texte_article(i):
     return i["nim"] + ("" if i["four"].upper() == "X" else " " + i["four"])
 
 
-# ----------------------------- Recherche (sans IA) ------------------------
-def construire_index(sub, modeles):
-    """Profil de mots par sous-famille : libelle du Referentiel (poids 3) + designations validees (poids 1)."""
-    prof = {k: {w: 3.0 for w in mots(lib)} for k, lib in sub.items()}
-    for m in modeles:
-        if f"{m['K']}-{m['M']}" in prof:
-            for w in mots(texte_article(m)):
-                prof[f"{m['K']}-{m['M']}"].setdefault(w, 1.0)
-    df = Counter(w for p in prof.values() for w in p)
-    return prof, df
-
-
-def classer(i, index):
-    """[(score, cle)] decroissant. Un mot de l'article correspond a un mot du profil s'il est identique
-    ou si l'un est le debut de l'autre (>= 4 lettres, poids / 2) : 'tele' ~ 'televiseur'."""
-    prof, df = index
-    art, res = mots(texte_article(i)), []
-    for k, p in prof.items():
-        s = 0.0
-        for w in art:
-            s += max((poids * math.log(1 + len(prof) / df[pw]) * (1 if pw == w else 0.5) for pw, poids in p.items()
-                      if pw == w or (min(len(w), len(pw)) >= 4 and (pw.startswith(w) or w.startswith(pw)))), default=0.0)
-        res.append((s, k))
-    return sorted(res, reverse=True)
-
-
-def proches(i, candidats, n):
-    """Les n lignes modeles les plus proches de l'article (jetons lettres + chiffres communs)."""
-    jet = lambda x: set(re.findall(r"[a-z0-9]+", norm(texte_article(x))))
-    a = jet(i)
-    return sorted(candidats, key=lambda m: -len(a & jet(m)))[:n]
-
-
 # ----------------------------- Etape 1 : sous-famille ---------------------
-def choisir_sous_famille(i, classement, sub, modeles):
-    """Renvoie (cle, sure, famille). Direct (sure) si evident ; sinon l'IA tranche entre quelques candidates
-    (sure seulement si elle confirme la recherche) ; si elle ne sait pas, on garde la meilleure candidate de la recherche."""
-    (s1, k1), s2 = classement[0], classement[1][0] if len(classement) > 1 else 0
-    famille = k1.split("-")[0] if s1 > 0 else None
-    if s1 >= SEUIL_DIRECT and s1 >= RATIO_DIRECT * s2:
-        print(f"  Etape 1/2 : {VERT}{k1} (choix direct, score {s1:.1f} contre {s2:.1f}, 0 appel IA){FIN}", flush=True)
-        return k1, True, famille
-    cand = [k for s, k in classement[:NB_CANDIDATES]] if s1 > 0 else list(sub)
-    print(f"  Etape 1/2 : ambigu (score {s1:.1f} contre {s2:.1f}) -> IA sur {len(cand)} candidates", flush=True)
-    lignes = []
-    for k in cand:
-        ex = proches(i, [m for m in modeles if f"{m['K']}-{m['M']}" == k], 1)
-        lignes.append(f"{k} : {sub[k]}" + (f" (ex: {ex[0]['nim'][:40]})" if ex else ""))
-    fixe = 'Choisis la cle de sous-famille de l\'article. Reponds en JSON : {"cle": "XXX-YY"}.\nCles :\n' + "\n".join(lignes)
-    var = f"Article : {texte_article(i)[:200]}"
-    for essai in range(2):
-        cle = txt(appeler_ia(fixe, var + ("\nreponds uniquement par une cle de la liste." if essai else ""),
-                             f"etape 1, essai {essai + 1}").get("cle")).upper()
-        if cle in sub:
-            return cle, cle == k1, famille  # sure si l'IA et la recherche sont d'accord
-    return (k1, False, famille) if s1 > 0 else (None, False, None)
+def choisir_sous_famille(i, vi, vec_lib, voisins, sub):
+    """Renvoie (cle, sure, autres candidates). Signaux : (1) similarite de sens avec le libelle de chaque sous-famille (marche meme
+    sans exemple) ; (2) vote des lignes validees les plus proches. Net -> decision directe ; sinon le LLM tranche
+    entre quelques candidates, et le choix n'est sur que s'il confirme l'un des deux signaux."""
+    lib = sorted(((cos(vi, v), k) for k, v in vec_lib.items()), reverse=True)
+    nb = sorted(((cos(vi, v), m) for m, v in voisins), key=lambda x: -x[0])[:K_VOISINS]
+    vote = Counter()
+    for s, m in nb[:5]:
+        vote[f"{m['K']}-{m['M']}"] += s
+    knn = vote.most_common(1)[0][0] if vote else None
+    accord = sum(1 for s, m in nb[:5] if f"{m['K']}-{m['M']}" == knn)
+    ecart, l1 = lib[0][0] - lib[1][0], lib[0][1]
+    if ecart >= ECART_DIRECT or (l1 == knn and accord >= ACCORD_DIRECT):
+        cle = l1 if ecart >= ECART_DIRECT else knn
+        print(f"  Etape 1/2 : {VERT}{cle} (sens proche du libelle, ecart {ecart:.2f} ; voisins d'accord {accord}/5, 0 appel LLM){FIN}", flush=True)
+        return cle, True, [k for s, k in lib[1:3]] + ([knn] if knn and knn != cle else [])
+    cand = list(dict.fromkeys([k for s, k in lib[:3]] + [k for k, _ in vote.most_common(2)] + ([knn] if knn else [])))[:NB_CANDIDATES]
+    print(f"  Etape 1/2 : ambigu (libelle {l1} ecart {ecart:.2f}, voisins {knn} {accord}/5) -> LLM sur {len(cand)} candidates", flush=True)
+    fixe = ("Choisis la sous-famille de l'article de consommables industriels. Reponds en JSON {\"cle\": \"...\"}.\n"
+            "Sous-familles possibles :\n" + "\n".join(f"{k} : {sub[k]}" for k in cand)
+            + "\n\nExemples deja codes :\n" + "\n".join(f"{m['nim'][:60]} -> {m['K']}-{m['M']}" for s, m in nb))
+    cle = txt(appeler_ia(fixe, f"Article : {texte_article(i)[:200]}", "etape 1", cand).get("cle"))
+    cle = cle if cle in cand else l1
+    return cle, cle in (l1, knn), [k for k in cand if k != cle]
 
 
 # ----------------------------- Etape 2 : detail par regles ----------------
@@ -260,7 +241,8 @@ def attributs(t):
     mot = "FIN" if m(r"\b(ultra |tres |very )?fin(e)?\b") else "MOY" if m(r"moyen|medium") else None
     ta = m(r"(?:taille|pointure)\s*[.:]?\s*" + N + r"(?:/(\d{1,2}(?:[.,]\d)?)(?!\d))?") or m(r"\bt\s*(\d{1,2})\b")
     vol, mm, lum = m(N + r"\s*(?:l|litres?)\b"), m(N + r"\s*mm"), m(N + r"\s*lumens?")
-    return {"mm": mm and _f(mm.group(1)), "lum": lum and _f(lum.group(1)), "diam": diam, "dims": [_f(x) for x in dims.groups() if x] if dims else None,
+    dims = [_f(x) for x in dims.groups() if x] if dims else None
+    return {"mm": mm and _f(mm.group(1)), "lum": lum and _f(lum.group(1)), "diam": diam, "dims": dims if dims and all(float(x) <= 999 for x in dims) else None,  # 100x10000 n'est pas une roue
             "g": mot or (_f(g.group(1)) + (g.group(2) or "") if g else None),
             "taille": ta and "".join(_f(x) for x in ta.groups() if x), "vol": vol and _f(vol.group(1))}
 
@@ -296,17 +278,22 @@ def apprendre_types(lignes, seuil):
     return out
 
 
-def type_par_ia(cle, sub, i, types):
-    """Sous-famille sans aucun code connu : l'IA choisit le type par analogie avec les sous-familles deja apprises."""
+def type_par_ia(cle, sub, i, types, vec_lib):
+    """Sous-famille sans aucun code connu : le LLM choisit le type par analogie avec les 6 sous-familles
+    deja apprises dont le libelle est le plus proche (par le sens)."""
+    proches = sorted((k for k, t in types.items() if t and k in vec_lib), key=lambda k: -cos(vec_lib[cle], vec_lib[k]))[:6]
     fixe = ("Quel type de detail convient a la sous-famille ? Reponds en JSON {\"cle\": \"TYPE\"}.\nTypes :\n"
             + "\n".join(f"{t} : {d}" for t, (_, d) in TYPES.items()) + "\n\nDeja etablis :\n"
-            + "\n".join(f"- {sub[k]} -> {t}" for k, t in types.items() if t and k in sub))
+            + "\n".join(f"- {sub[k]} -> {types[k]}" for k in proches))
     return txt(appeler_ia(fixe, f"Sous-famille : {sub[cle]}\nArticle : {texte_article(i)[:160]}", "type de detail", list(TYPES)).get("cle"))
 
 
 def construire_detail(i, cle, typ, utilises):
     """Renvoie (detail, probleme) ; probleme = None si le code est valide et unique."""
     d = TYPES[typ][0](extraire(i)) if typ else None
+    ref = re.search(r"\b([A-Z]{1,4})-?(\d{1,4}[A-Z]?)\b", i["nim"])  # regle 4 : DR-62 -> DR62-5L
+    if d and typ == "VOLUME" and f"{cle}-{d}" in utilises and ref:
+        d = ref.group(1) + ref.group(2) + "-" + d
     probleme = ("detail propre au produit" if not typ else "attribut introuvable" if not d else
                 "code trop long" if len(f"{cle}-{d}") > LONGUEUR_MAX else "collision" if f"{cle}-{d}" in utilises else None)
     print(f"  Etape 2/2 : {VERT if not probleme else ROUGE}detail {d or '?'} (type {typ}){FIN}", flush=True)
@@ -353,7 +340,7 @@ def afficher_ligne(ws, r, sens):
         print(f"    {pastille(rgb)} {nom_couleur(rgb)} (#{rgb}) colonnes {','.join(lettres)}" + (f" = {s}" if s else ""))
 
 
-def traiter_fichier(chemin, horodatage, rapport):
+def traiter_fichier(chemin, horodatage, rapport, cache):
     wb = load_workbook(chemin)  # sans data_only : on garde toutes les formules
     if "Codification" not in wb.sheetnames or "Referentiel" not in wb.sheetnames:
         print("  -> onglets 'Codification' / 'Referentiel' introuvables, fichier ignore.")
@@ -374,34 +361,39 @@ def traiter_fichier(chemin, horodatage, rapport):
     nb_f = lambda r: sum(txt(ws.cell(r, c).value).startswith("=") for c in range(1, ws.max_column + 1))
     tpl = max((m["ligne"] for m in modeles), key=nb_f, default=None)
     cols_f = [c for c in range(1, ws.max_column + 1) if tpl and txt(ws.cell(tpl, c).value).startswith("=")]
-    index, utilises, par_ia = construire_index(sub, modeles), {code_de(m) for m in modeles}, set()
+    utilises, par_ia = {code_de(m) for m in modeles}, set()
     types = {**apprendre_types(a_traiter, 0.8), **apprendre_types(modeles, 0.5)}  # lignes validees d'abord
     print(f"  Formats de detail appris : {sum(1 for t in types.values() if t)} sous-familles ; "
           f"{sum(1 for t in types.values() if not t)} a codes propres au produit.")
     print(f"  {len(modeles)} lignes modeles, {len(a_traiter)} lignes a traiter.")
     stats, debut = Counter(), time.time()
+    vecs = embeddings([texte_article(m) for m in modeles] + [texte_article(i) for i in a_traiter] + list(sub.values()), cache)
+    voisins, vec_art = list(zip(modeles, vecs)), vecs[len(modeles):len(modeles) + len(a_traiter)]
+    vec_lib = dict(zip(sub, vecs[len(modeles) + len(a_traiter):]))
 
-    for n, i in enumerate(a_traiter):
+    for n, (i, vi) in enumerate(zip(a_traiter, vec_art)):
         r, ancien = i["ligne"], code_de(i) or "aucun"
         afficher_ligne(ws, r, sens)
         K = M = N = None
         try:
-            classement = classer(i, index)
-            cle, sure_sf, famille = choisir_sous_famille(i, classement, sub, modeles)
-            if cle:
-                K, M = cle.split("-", 1)
-                if cle not in types:
-                    types[cle] = type_par_ia(cle, sub, i, types)
-                    par_ia.add(cle)
-                N, probleme = construire_detail(i, cle, types[cle], utilises)
-                statut = f"A VERIFIER : {probleme}" if probleme else "A VERIFIER : sous-famille incertaine" if not sure_sf \
-                    else "A VERIFIER : type de detail choisi par l'IA" if cle in par_ia else "OK"
-                if N:
-                    utilises.add(f"{cle}-{N}")
-                if statut == "OK" and i["four"].upper() in ("", "X"):
-                    statut = "OK (sans designation fournisseur)"
-            else:
-                K, statut = famille, "A VERIFIER : sous-famille introuvable"
+            cle, sure_sf, autres = choisir_sous_famille(i, vi, vec_lib, voisins, sub)
+            for essai, c in enumerate([cle] + [a for a in autres if types.get(a)]):
+                if c not in types:
+                    types[c] = type_par_ia(c, sub, i, types, vec_lib)
+                    par_ia.add(c)
+                N, probleme = construire_detail(i, c, types[c], utilises)
+                if N or not types[c]:  # trouve, ou codes propres au produit : on garde cette sous-famille
+                    break
+                print(f"     {GRIS}format de {c} inapplicable a cet article : on essaie la candidate suivante{FIN}", flush=True)
+            if N and c != cle:
+                cle, sure_sf = c, False  # sous-famille deduite du format : a confirmer
+            K, M = cle.split("-", 1)
+            statut = f"A VERIFIER : {probleme}" if probleme else "A VERIFIER : sous-famille incertaine" if not sure_sf \
+                else "A VERIFIER : type de detail choisi par l'IA" if cle in par_ia else "OK"
+            if N:
+                utilises.add(f"{cle}-{N}")
+            if statut == "OK" and i["four"].upper() in ("", "X"):
+                statut = "OK (sans designation fournisseur)"
         except Exception as e:  # toute erreur : on marque la ligne et on continue
             print(f"     {ROUGE}erreur : {e}{FIN}")
             statut = "A VERIFIER : erreur IA"
@@ -448,9 +440,15 @@ def main():
         sys.exit(f"Le dossier '{DOSSIER_INPUT.name}' ne contient aucun fichier .xlsx : depose ton fichier Excel dedans.")
     verifier_ollama()
     maintenant, rapport = datetime.now(), []
+    chemin_cache = DOSSIER_OUTPUT / "cache_embeddings.json"
+    try:
+        cache = json.loads(chemin_cache.read_text())
+    except (OSError, ValueError):
+        cache = {}
     for f in fichiers:
         print(f"\n=== {f.name} ===")
-        traiter_fichier(f, maintenant.strftime("%Y-%m-%d_%Hh%M"), rapport)
+        traiter_fichier(f, maintenant.strftime("%Y-%m-%d_%Hh%M"), rapport, cache)
+        chemin_cache.write_text(json.dumps(cache))
     chemin_csv = DOSSIER_OUTPUT / f"rapport_{maintenant.strftime('%Y-%m-%d')}.csv"
     with open(chemin_csv, "w", newline="", encoding="utf-8-sig") as fh:
         w = csv.writer(fh, delimiter=";")
