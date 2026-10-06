@@ -97,12 +97,14 @@ def verifier_ollama():
         "messages": [{"role": "user", "content": "ok"}]})
 
 
-def appeler_ia(fixe, variable, titre):
-    """Appel Ollama independant (aucun historique). Partie fixe d'abord : le cache Ollama la reutilise."""
+def appeler_ia(fixe, variable, titre, choix=None):
+    """Appel Ollama independant (aucun historique). Partie fixe d'abord : le cache Ollama la reutilise.
+    Si `choix` est donne, la reponse est contrainte a {"cle": <une valeur de choix>}."""
     print(f"     {GRIS}[{titre}] ENVOI ({len(fixe) + len(variable)} car.){FIN} " + variable.replace("\n", " / "), flush=True)
     debut = time.time()
+    forme = {"type": "object", "properties": {"cle": {"type": "string", "enum": choix}}, "required": ["cle"]} if choix else "json"
     r = requests.post(f"{URL_OLLAMA}/api/chat", timeout=600, json={
-        "model": MODELE, "stream": False, "format": "json", "keep_alive": "30m",
+        "model": MODELE, "stream": False, "format": forme, "keep_alive": "30m",
         "options": {"temperature": 0, "num_ctx": NUM_CTX, "num_predict": NUM_PREDICT, "num_thread": NUM_THREAD},
         "messages": [{"role": "user", "content": fixe + "\n\n" + variable}]})
     r.raise_for_status()
@@ -225,102 +227,90 @@ def choisir_sous_famille(i, classement, sub, modeles):
     return (k1, False, famille) if s1 > 0 else (None, False, None)
 
 
-# ----------------------------- Etape 2 : detail (sans IA) -----------------
-ROLES_MOTS = {"g": "g", "gr": "g", "grain": "g", "d": "d", "\u00f8": "d", "dia": "d", "diam": "d", "diametre": "d",
-              "t": "t", "taille": "t", "pointure": "t", "l": "l", "long": "l", "longueur": "l"}
+# ----------------------------- Etape 2 : detail par regles ----------------
+# Regles deduites de l'Excel (section 5) : chaque TYPE de detail est un format applique a des attributs lus
+# dans les designations (fournisseur d'abord). Le type est fixe par sous-famille, jamais par ligne.
+N = r"(\d+(?:[.,]\d+)?)"
+KX = r"\s*[x*\u00d7]\s*"
+TYPES = {  # type -> (format, description donnee a l'IA quand aucune ligne validee n'existe)
+    "DIAM": (lambda a: (a["diam"] or a["dims"] and a["dims"][0]) and "D" + (a["diam"] or a["dims"][0]),
+             "diametre seul : D6.5 (forets, brosses)"),
+    "TAILLE": (lambda a: a["taille"] and "T" + a["taille"], "taille : T10 (gants, chaussures, vetements)"),
+    "TIGE": (lambda a: a["dims"] and a["g"] and f"D{a['dims'][0]}.{a['dims'][1]}-G{a['g']}",
+             "outil rotatif sur tige (roue, manchon) : D30.15-G80"),
+    "DISQUE": (lambda a: a["diam"] and a["g"] and f"D{a['diam']}G{a['g']}", "disque : diametre et grain, D125G36"),
+    "PLAT": (lambda a: a["dims"] and a["g"] and f"{a['dims'][0]}.{a['dims'][1]}G{a['g']}",
+             "produit plat (bande, feuille, capuchon) : dim1.dim2 et grain, 23.28G400"),
+    "GRAIN": (lambda a: a["g"] and "G" + a["g"], "grain seul : G80 (rouleaux, disques de poncage)"),
+    "COTE": (lambda a: a["dims"] and f"D{a['dims'][0]}.{a['dims'][1]}", "support : cotes du consommable porte, D6.10"),
+    "VOLUME": (lambda a: a["vol"] and a["vol"] + "L", "produit liquide : volume, 5L"),
+    "LARGEUR": (lambda a: a["mm"] and "L" + a["mm"], "ruban, rouleau adhesif : L25 (largeur en mm)"),
+    "LUMENS": (lambda a: a["lum"] and "L" + a["lum"], "lampe : L300 (lumens)"),
+    "STD": (lambda a: "STD", "outil ou EPI unique sans variante : STD"),
+}
 
 
-def nombres(t):
-    """[(nombre, role)] dans l'ordre. 3,7 et 3.7mm = decimaux ; 30.15 (sans unite) = deux cotes.
-    role = mot colle au nombre : 'G80', 'grain 80' -> g ; 'D125', 'diam 125', '\u00f8125' -> d ; 'T10' -> t."""
-    t, res = norm(t), []
-    for m in re.finditer(r"\d+[.,]\d+(?=\s*[mc]m\b)|\d+(?:,\d+)?", t):
-        c = re.search(r"([a-z\u00f8]+)[ .:=]{0,3}$", t[:m.start()])
-        mot = c.group(1) if c else ""
-        role = ROLES_MOTS.get(mot, mot if len(mot) == 1 else "")
-        if not role and re.match(r"\s*diam", t[m.end():]):
-            role = "d"
-        res.append((m.group().replace(",", "."), role))
-    return res
+def attributs(t):
+    """Attributs lus dans UNE designation (deja normalisee par norm)."""
+    m = lambda p: re.search(p, t)
+    diam = next((_f(x.group(1)) for x in (m(r"(?:diametre|diam|dia)\.?\s*:?\s*" + N), m(r"\u00f8\s*" + N),
+                                          m(r"\bd\.?\s*" + N + r"\s*mm"), m(N + r"\s*mm"), m(r"\bd\.?\s*" + N)) if x), None)
+    dims = m(N + KX + N + "(?:" + KX + N + ")?") or m(r"\bd\s*" + N + r"\s*l\s*" + N) or m(r"\b(\d{1,3})\.(\d{1,3})\b(?!\s*mm)")
+    g = m(r"\b(?:grain|gr|g|p)\.?\s*[:.]?\s*(?:a|ceramique|oxy\w*|alu\w*)?\s*" + N + r"\s*(\+)?")
+    mot = "FIN" if m(r"\b(ultra |tres |very )?fin(e)?\b") else "MOY" if m(r"moyen|medium") else None
+    ta = m(r"(?:taille|pointure)\s*[.:]?\s*" + N + r"(?:/(\d{1,2}(?:[.,]\d)?)(?!\d))?") or m(r"\bt\s*(\d{1,2})\b")
+    vol, mm, lum = m(N + r"\s*(?:l|litres?)\b"), m(N + r"\s*mm"), m(N + r"\s*lumens?")
+    return {"mm": mm and _f(mm.group(1)), "lum": lum and _f(lum.group(1)), "diam": diam, "dims": [_f(x) for x in dims.groups() if x] if dims else None,
+            "g": mot or (_f(g.group(1)) + (g.group(2) or "") if g else None),
+            "taille": ta and "".join(_f(x) for x in ta.groups() if x), "vol": vol and _f(vol.group(1))}
 
 
-def gabarit(texte, detail):
-    """Detail valide d'une ligne modele + sa designation -> morceaux : texte fixe, ('role', lettre) ou indice
-    d'un nombre de la designation. None si un nombre du detail est introuvable dans la designation."""
-    nums, det, seg, k = nombres(texte), nettoyer(detail), [], 0
-    vals = [v for v, _ in nums]
-    while k < len(det):
-        if det[k].isdigit():
-            n = next((n for n in sorted(vals, key=len, reverse=True) if det.startswith(n, k)), None)
-            if n is None:
-                return None
-            lettre = det[k - 1].lower() if k and det[k - 1].isalpha() else ""
-            seg.append(("role", lettre) if lettre and nums[vals.index(n)][1] == lettre else vals.index(n))
-            k += len(n)
-        else:
-            seg.append(det[k])
-            k += 1
-    return seg
+def _f(x):
+    return x.replace(",", ".")
 
 
-def appliquer(seg, nums):
-    """Remplit un gabarit avec les nombres d'un article ; None si un nombre manque."""
-    out = []
-    for p in seg:
-        if isinstance(p, tuple):
-            p = next((v for v, r in nums if r == p[1]), None)
-        elif isinstance(p, int):
-            p = nums[p][0] if p < len(nums) else None
-        if p is None:
-            return None
-        out.append(p)
-    return "".join(out)
+def extraire(i):
+    """Attributs de l'article : designation fournisseur d'abord, NIMRODA pour completer ; '+' du grain si l'une le porte."""
+    a = {}
+    for t in (norm(i["four"]) if i["four"].upper() != "X" else "", norm(i["nim"])):
+        for k, v in attributs(t).items():
+            if v and not a.get(k):
+                a[k] = v
+        if re.search(r"\d\s*\+", t) and a.get("g", "").isdigit():
+            a["g"] += "+"
+    return {k: a.get(k) for k in ("diam", "dims", "g", "taille", "vol", "mm", "lum")}
 
 
-def detail_par_gabarit(i, pareils):
-    """Chaque ligne validee voisine vote : son gabarit (lu dans la designation fournisseur d'abord, puis NIMRODA)
-    est applique aux nombres de l'article. Renvoie (detail, sur) ; sur = au moins 2 votes, tous identiques."""
-    votes, total, t = Counter(), 0, texte_article(i)
-    for m in proches(i, pareils, 5):
-        for sm, si in (("four", "four"), ("nim", "nim"), ("four", "nim"), ("nim", "four")):  # meme source d'abord
-            if all(x and x.upper() != "X" for x in (m[sm], i[si])):
-                g = gabarit(m[sm], m["N"])
-                d = g and (any(not isinstance(p, str) for p in g) or "".join(g) == "STD") and appliquer(g, nombres(i[si]))
-                if d:
-                    if re.search(r"G(MOY|FIN)", d):  # grains en mots (regle utilisateur)
-                        mot = "GFIN" if re.search(r"\b(ultra |tres )?fin\b", norm(t)) else "GMOY" if "moyen" in norm(t) else None
-                        d = re.sub(r"G(MOY|FIN)", mot, d) if mot else d
-                    votes[d] += 1
-                    total += 1
-                    break
-    if not votes:
-        return None, False
-    d, n = votes.most_common(1)[0]
-    return d, total >= 2 and n == total
+def apprendre_types(lignes, seuil):
+    """{cle: type} : pour chaque sous-famille, le type dont le format reproduit les codes des lignes
+    (None si aucun ne les reproduit : codes propres au produit)."""
+    par = {}
+    for m in lignes:
+        if code_de(m):
+            par.setdefault(f"{m['K']}-{m['M']}", []).append(m)
+    out = {}
+    for cle, ex in par.items():
+        taux = {t: sum(f(extraire(m)) == nettoyer(m["N"]) for m in ex) / len(ex) for t, (f, _) in TYPES.items()}
+        t = max(taux, key=taux.get)
+        out[cle] = t if taux[t] >= seuil else None
+    return out
 
 
-def detail_generique(i):
-    """Sans modele voisin (ou gabarit impossible) : regles de la section 5 appliquees aux nombres reperes
-    par leur role (volume 5L, D<diametre>, G<grain>, T<taille>)."""
-    nums = nombres(i["four"] if i["four"].upper() not in ("", "X") else i["nim"]) or nombres(i["nim"])
-    vol = re.search(r"(\d+(?:[.,]\d+)?) ?(?:l|litres?)\b", norm(texte_article(i)))
-    if vol:
-        return vol.group(1).replace(",", ".") + "L"
-    d = "".join(f"{p}{v}" for p, r in (("D", "d"), ("G", "g"), ("T", "t")) for v in [next((v for v, c in nums if c == r), "")] if v)
-    return d or "STD"  # regle 5 : sans cote ni variante, STD (a verifier)
+def type_par_ia(cle, sub, i, types):
+    """Sous-famille sans aucun code connu : l'IA choisit le type par analogie avec les sous-familles deja apprises."""
+    fixe = ("Quel type de detail convient a la sous-famille ? Reponds en JSON {\"cle\": \"TYPE\"}.\nTypes :\n"
+            + "\n".join(f"{t} : {d}" for t, (_, d) in TYPES.items()) + "\n\nDeja etablis :\n"
+            + "\n".join(f"- {sub[k]} -> {t}" for k, t in types.items() if t and k in sub))
+    return txt(appeler_ia(fixe, f"Sous-famille : {sub[cle]}\nArticle : {texte_article(i)[:160]}", "type de detail", list(TYPES)).get("cle"))
 
 
-def construire_detail(i, cle, modeles, utilises):
-    """Renvoie (detail, probleme, sur) ; probleme = collision / trop long ou None."""
-    pareils = [m for m in modeles if f"{m['K']}-{m['M']}" == cle] or [m for m in modeles if m["K"] == cle.split("-")[0]]
-    d, sur = detail_par_gabarit(i, pareils)
-    methode = f"gabarit de {len(pareils)} lignes validees, {'concordant' if sur else 'avis partages'}"
-    if not d:
-        d, sur, methode = detail_generique(i), False, "regles generiques, aucun gabarit applicable"
-    probleme = ("code trop long" if len(f"{cle}-{d}") > LONGUEUR_MAX
-                else "collision" if f"{cle}-{d}" in utilises else None)
-    print(f"  Etape 2/2 : {VERT if sur and not probleme else ROUGE}detail {d} ({methode}){FIN}", flush=True)
-    return d, probleme, sur
+def construire_detail(i, cle, typ, utilises):
+    """Renvoie (detail, probleme) ; probleme = None si le code est valide et unique."""
+    d = TYPES[typ][0](extraire(i)) if typ else None
+    probleme = ("detail propre au produit" if not typ else "attribut introuvable" if not d else
+                "code trop long" if len(f"{cle}-{d}") > LONGUEUR_MAX else "collision" if f"{cle}-{d}" in utilises else None)
+    print(f"  Etape 2/2 : {VERT if not probleme else ROUGE}detail {d or '?'} (type {typ}){FIN}", flush=True)
+    return d or None, probleme
 
 
 # ----------------------------- Ecriture dans le classeur ------------------
@@ -384,7 +374,10 @@ def traiter_fichier(chemin, horodatage, rapport):
     nb_f = lambda r: sum(txt(ws.cell(r, c).value).startswith("=") for c in range(1, ws.max_column + 1))
     tpl = max((m["ligne"] for m in modeles), key=nb_f, default=None)
     cols_f = [c for c in range(1, ws.max_column + 1) if tpl and txt(ws.cell(tpl, c).value).startswith("=")]
-    index, utilises = construire_index(sub, modeles), {code_de(m) for m in modeles}
+    index, utilises, par_ia = construire_index(sub, modeles), {code_de(m) for m in modeles}, set()
+    types = {**apprendre_types(a_traiter, 0.8), **apprendre_types(modeles, 0.5)}  # lignes validees d'abord
+    print(f"  Formats de detail appris : {sum(1 for t in types.values() if t)} sous-familles ; "
+          f"{sum(1 for t in types.values() if not t)} a codes propres au produit.")
     print(f"  {len(modeles)} lignes modeles, {len(a_traiter)} lignes a traiter.")
     stats, debut = Counter(), time.time()
 
@@ -397,9 +390,12 @@ def traiter_fichier(chemin, horodatage, rapport):
             cle, sure_sf, famille = choisir_sous_famille(i, classement, sub, modeles)
             if cle:
                 K, M = cle.split("-", 1)
-                N, probleme, sur = construire_detail(i, cle, modeles, utilises)
+                if cle not in types:
+                    types[cle] = type_par_ia(cle, sub, i, types)
+                    par_ia.add(cle)
+                N, probleme = construire_detail(i, cle, types[cle], utilises)
                 statut = f"A VERIFIER : {probleme}" if probleme else "A VERIFIER : sous-famille incertaine" if not sure_sf \
-                    else "A VERIFIER : detail incertain" if not sur else "OK"
+                    else "A VERIFIER : type de detail choisi par l'IA" if cle in par_ia else "OK"
                 if N:
                     utilises.add(f"{cle}-{N}")
                 if statut == "OK" and i["four"].upper() in ("", "X"):
