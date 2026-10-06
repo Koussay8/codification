@@ -31,7 +31,7 @@ LONGUEUR_MAX = 30
 NUM_CTX, NUM_PREDICT = 2048, 40               # contexte minimal = RAM / CPU legers
 NUM_THREAD = max(2, (os.cpu_count() or 4) // 2)  # coeurs physiques (hyper-threading inutile)
 SEUIL_DIRECT, RATIO_DIRECT = 6.0, 1.6           # choix sans IA si score >= seuil et >= ratio x 2e
-NB_CANDIDATES, NB_EXEMPLES = 6, 6
+NB_CANDIDATES = 6
 LIGNES_REFERENTIEL = 500  # les plages VLOOKUP vers le Referentiel sont elargies jusque-la
 # role -> (regex cherchee dans l'en-tete de la ligne 1, colonne par defaut)
 ROLES = {"K": ("code famille", 11), "M": ("code sous", 13), "N": ("^detail", 14),
@@ -40,12 +40,6 @@ ROLES = {"K": ("code famille", 11), "M": ("code sous", 13), "N": ("^detail", 14)
 PALETTE = {"jaune": "FFFF00", "rouge": "FF0000", "rouge clair": "F8D7DA", "bleu clair": "E8F0FE",
            "bleu fonce": "1F4E78", "orange clair": "FFD8A8", "jaune clair": "FFF3CD",
            "vert clair": "C6EFCE", "gris": "D9D9D9", "blanc": "FFFFFF"}
-REGLES = """Format du DETAIL : majuscules, sans espace ni accent, caracteres A-Z 0-9 . - + ; code complet FAM-SOUS-DETAIL <= 30 caracteres.
-- Abrasif ou foret : toujours la cote, jamais STD. Diametre D125, D1.6 ; deux dimensions separees par un point 16.26, D13.10 ; grain G120, G36+, GMOY (moyen), GFIN (fin/tres fin).
-- Outil rotatif sur tige (roue, manchon) : D<diam>.<largeur>-G<grain> (D6.10-G150). Produit plat (bande, feuille, rouleau) : <dim1>.<dim2>G<grain> (23.28G400).
-- Un support reprend la cote du consommable qu'il porte (support D6.10 <-> manchon D6.10-G150).
-- Taille : T39, T10, T2XL, TXL, TL, TM, TS. Volume : 5L (si deux produits ont le meme volume, ajouter la reference : DR62-5L).
-- STD seulement pour un EPI/outil unique sans variante. Si designation NIMRODA et fournisseur different, le fournisseur l'emporte."""
 ROUGE, VERT, GRIS, FIN = "\x1b[31m", "\x1b[32m", "\x1b[90m", "\x1b[0m"
 
 
@@ -206,43 +200,54 @@ def proches(i, candidats, n):
     return sorted(candidats, key=lambda m: -len(a & jet(m)))[:n]
 
 
-# ----------------------------- Les 2 etapes -------------------------------
+# ----------------------------- Etape 1 : sous-famille ---------------------
 def choisir_sous_famille(i, classement, sub, modeles):
-    """Etape 1 : renvoie (cle ou None, famille probable). Direct si evident, sinon IA sur quelques candidates."""
+    """Renvoie (cle, sure, famille). Direct (sure) si evident ; sinon l'IA tranche entre quelques candidates
+    (sure seulement si elle confirme la recherche) ; si elle ne sait pas, on garde la meilleure candidate de la recherche."""
     (s1, k1), s2 = classement[0], classement[1][0] if len(classement) > 1 else 0
     famille = k1.split("-")[0] if s1 > 0 else None
     if s1 >= SEUIL_DIRECT and s1 >= RATIO_DIRECT * s2:
         print(f"  Etape 1/2 : {VERT}{k1} (choix direct, score {s1:.1f} contre {s2:.1f}, 0 appel IA){FIN}", flush=True)
-        return k1, famille
+        return k1, True, famille
     cand = [k for s, k in classement[:NB_CANDIDATES]] if s1 > 0 else list(sub)
     print(f"  Etape 1/2 : ambigu (score {s1:.1f} contre {s2:.1f}) -> IA sur {len(cand)} candidates", flush=True)
     lignes = []
     for k in cand:
         ex = proches(i, [m for m in modeles if f"{m['K']}-{m['M']}" == k], 1)
         lignes.append(f"{k} : {sub[k]}" + (f" (ex: {ex[0]['nim'][:40]})" if ex else ""))
-    fixe = 'Choisis la cle de sous-famille de l\'article. Reponds en JSON : {"cle": "XXX-YY"} ou {"cle": "AUCUNE"}.\nCles :\n' + "\n".join(lignes)
+    fixe = 'Choisis la cle de sous-famille de l\'article. Reponds en JSON : {"cle": "XXX-YY"}.\nCles :\n' + "\n".join(lignes)
     var = f"Article : {texte_article(i)[:200]}"
     for essai in range(2):
         cle = txt(appeler_ia(fixe, var + ("\nreponds uniquement par une cle de la liste." if essai else ""),
                              f"etape 1, essai {essai + 1}").get("cle")).upper()
         if cle in sub:
-            return cle, famille
-    return None, famille
+            return cle, cle == k1, famille  # sure si l'IA et la recherche sont d'accord
+    return (k1, False, famille) if s1 > 0 else (None, False, None)
+
+
+# ----------------------------- Etape 2 : detail (sans IA) -----------------
+ROLES_MOTS = {"g": "g", "gr": "g", "grain": "g", "d": "d", "\u00f8": "d", "dia": "d", "diam": "d", "diametre": "d",
+              "t": "t", "taille": "t", "pointure": "t", "l": "l", "long": "l", "longueur": "l"}
 
 
 def nombres(t):
-    """[(nombre, role)] dans l'ordre. Seule la virgule est decimale (3,7 -> 3.7) ; 30.15 = deux cotes.
-    role = 1re lettre du mot collé au nombre ('G80', 'grain 80' -> g ; 'D125', 'diametre 125' -> d)."""
-    t, res = txt(t), []
-    for m in re.finditer(r"\d+(?:,\d+)?", t):
-        c = re.search(r"([A-Za-z]+)[ .:]?$", t[:m.start()])
-        res.append((m.group().replace(",", "."), c.group(1)[0].lower() if c else ""))
+    """[(nombre, role)] dans l'ordre. 3,7 et 3.7mm = decimaux ; 30.15 (sans unite) = deux cotes.
+    role = mot colle au nombre : 'G80', 'grain 80' -> g ; 'D125', 'diam 125', '\u00f8125' -> d ; 'T10' -> t."""
+    t, res = norm(t), []
+    for m in re.finditer(r"\d+[.,]\d+(?=\s*[mc]m\b)|\d+(?:,\d+)?", t):
+        c = re.search(r"([a-z\u00f8]+)[ .:=]{0,3}$", t[:m.start()])
+        mot = c.group(1) if c else ""
+        role = ROLES_MOTS.get(mot, mot if len(mot) == 1 else "")
+        if not role and re.match(r"\s*diam", t[m.end():]):
+            role = "d"
+        res.append((m.group().replace(",", "."), role))
     return res
 
 
-def gabarit(m):
-    """Detail valide d'une ligne modele -> morceaux : texte fixe, ('role', lettre) ou indice d'un nombre."""
-    nums, det, seg, k = nombres(m["nim"]), nettoyer(m["N"]), [], 0
+def gabarit(texte, detail):
+    """Detail valide d'une ligne modele + sa designation -> morceaux : texte fixe, ('role', lettre) ou indice
+    d'un nombre de la designation. None si un nombre du detail est introuvable dans la designation."""
+    nums, det, seg, k = nombres(texte), nettoyer(detail), [], 0
     vals = [v for v, _ in nums]
     while k < len(det):
         if det[k].isdigit():
@@ -273,51 +278,49 @@ def appliquer(seg, nums):
 
 
 def detail_par_gabarit(i, pareils):
-    """Detail sans IA : applique aux nombres de l'article le gabarit des lignes validees les plus proches.
-    Accepte si au moins 2 gabarits donnent le meme resultat (ou s'il n'y a qu'un seul modele).
-    Renvoie (detail, sur) ; sur = tous les gabarits sont d'accord."""
-    nums, votes, total = nombres(i["nim"]), Counter(), 0
+    """Chaque ligne validee voisine vote : son gabarit (lu dans la designation fournisseur d'abord, puis NIMRODA)
+    est applique aux nombres de l'article. Renvoie (detail, sur) ; sur = au moins 2 votes, tous identiques."""
+    votes, total, t = Counter(), 0, texte_article(i)
     for m in proches(i, pareils, 5):
-        g = gabarit(m)
-        d = g and (any(not isinstance(p, str) for p in g) or "".join(g) == "STD") and appliquer(g, nums)
-        if d:
-            votes[d] += 1
-            total += 1
-    if votes:
-        d, n = votes.most_common(1)[0]
-        return (d, n == total) if n >= 2 or len(pareils) == 1 else (None, False)
-    return None, False
+        for sm, si in (("four", "four"), ("nim", "nim"), ("four", "nim"), ("nim", "four")):  # meme source d'abord
+            if all(x and x.upper() != "X" for x in (m[sm], i[si])):
+                g = gabarit(m[sm], m["N"])
+                d = g and (any(not isinstance(p, str) for p in g) or "".join(g) == "STD") and appliquer(g, nombres(i[si]))
+                if d:
+                    if re.search(r"G(MOY|FIN)", d):  # grains en mots (regle utilisateur)
+                        mot = "GFIN" if re.search(r"\b(ultra |tres )?fin\b", norm(t)) else "GMOY" if "moyen" in norm(t) else None
+                        d = re.sub(r"G(MOY|FIN)", mot, d) if mot else d
+                    votes[d] += 1
+                    total += 1
+                    break
+    if not votes:
+        return None, False
+    d, n = votes.most_common(1)[0]
+    return d, total >= 2 and n == total
+
+
+def detail_generique(i):
+    """Sans modele voisin (ou gabarit impossible) : regles de la section 5 appliquees aux nombres reperes
+    par leur role (volume 5L, D<diametre>, G<grain>, T<taille>)."""
+    nums = nombres(i["four"] if i["four"].upper() not in ("", "X") else i["nim"]) or nombres(i["nim"])
+    vol = re.search(r"(\d+(?:[.,]\d+)?) ?(?:l|litres?)\b", norm(texte_article(i)))
+    if vol:
+        return vol.group(1).replace(",", ".") + "L"
+    d = "".join(f"{p}{v}" for p, r in (("D", "d"), ("G", "g"), ("T", "t")) for v in [next((v for v, c in nums if c == r), "")] if v)
+    return d or "STD"  # regle 5 : sans cote ni variante, STD (a verifier)
 
 
 def construire_detail(i, cle, modeles, utilises):
-    """Etape 2 : gabarit appris des lignes validees, IA en secours. Renvoie (detail, probleme, origine)."""
+    """Renvoie (detail, probleme, sur) ; probleme = collision / trop long ou None."""
     pareils = [m for m in modeles if f"{m['K']}-{m['M']}" == cle] or [m for m in modeles if m["K"] == cle.split("-")[0]]
     d, sur = detail_par_gabarit(i, pareils)
-    if d and len(f"{cle}-{d}") <= LONGUEUR_MAX and f"{cle}-{d}" not in utilises:
-        print(f"  Etape 2/2 : {VERT}detail {d} (gabarit des lignes validees voisines, "
-              f"{'concordant' if sur else 'avis partages'}, 0 appel IA){FIN}", flush=True)
-        return d, None, "gabarit" if sur else "incertain"
-    exemples = "\n".join(f"{m['nim'][:60]} -> {nettoyer(m['N'])}" for m in proches(i, pareils, NB_EXEMPLES))
-    deja = ", ".join(sorted(c.split("-", 2)[2] for c in utilises if c.startswith(cle + "-"))[-30:])
-    print(f"  Etape 2/2 : gabarit impossible ou en collision -> IA ({len(pareils)} exemples valides)", flush=True)
-    fixe = (f"{REGLES}\n\nSous-famille : {cle}\nExemples (article -> DETAIL) :\n{exemples or 'aucun'}\n"
-            'Details deja pris : ' + (deja or 'aucun') + '\nReponds en JSON : {"detail": "..."}')
-    var = f"Article : {texte_article(i)[:200]}\nNombres : {', '.join(v for v, _ in nombres(i['nim'])) or 'aucun'}"
-    detail, probleme = "", "detail vide"
-    for essai in range(2):
-        suite = "" if essai == 0 else f"\nATTENTION : {probleme} pour '{detail}'. Propose un autre detail."
-        detail = nettoyer(appeler_ia(fixe, var + suite, f"etape 2, essai {essai + 1}").get("detail", ""))
-        if detail.startswith(cle + "-"):
-            detail = detail[len(cle) + 1:]
-        if not detail:
-            probleme = "detail vide"
-        elif len(f"{cle}-{detail}") > LONGUEUR_MAX:
-            probleme = "code trop long"
-        elif f"{cle}-{detail}" in utilises:
-            probleme = "collision : code deja utilise"
-        else:
-            return detail, None, "IA"
-    return detail, probleme, "IA"
+    methode = f"gabarit de {len(pareils)} lignes validees, {'concordant' if sur else 'avis partages'}"
+    if not d:
+        d, sur, methode = detail_generique(i), False, "regles generiques, aucun gabarit applicable"
+    probleme = ("code trop long" if len(f"{cle}-{d}") > LONGUEUR_MAX
+                else "collision" if f"{cle}-{d}" in utilises else None)
+    print(f"  Etape 2/2 : {VERT if sur and not probleme else ROUGE}detail {d} ({methode}){FIN}", flush=True)
+    return d, probleme, sur
 
 
 # ----------------------------- Ecriture dans le classeur ------------------
@@ -391,13 +394,12 @@ def traiter_fichier(chemin, horodatage, rapport):
         K = M = N = None
         try:
             classement = classer(i, index)
-            cle, famille = choisir_sous_famille(i, classement, sub, modeles)
+            cle, sure_sf, famille = choisir_sous_famille(i, classement, sub, modeles)
             if cle:
                 K, M = cle.split("-", 1)
-                N, probleme, origine = construire_detail(i, cle, modeles, utilises)
-                statut = f"A VERIFIER : {probleme.split(' :')[0]}" if probleme else \
-                    "A VERIFIER : detail propose par IA" if origine == "IA" else \
-                    "A VERIFIER : detail incertain (avis partages)" if origine == "incertain" else "OK"
+                N, probleme, sur = construire_detail(i, cle, modeles, utilises)
+                statut = f"A VERIFIER : {probleme}" if probleme else "A VERIFIER : sous-famille incertaine" if not sure_sf \
+                    else "A VERIFIER : detail incertain" if not sur else "OK"
                 if N:
                     utilises.add(f"{cle}-{N}")
                 if statut == "OK" and i["four"].upper() in ("", "X"):
